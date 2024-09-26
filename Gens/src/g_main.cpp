@@ -33,6 +33,7 @@ using idadebug::SoundBankMap;
 using idadebug::SoundBankRange;
 #endif
 using idadebug::Changed;
+using idadebug::Condition;
 using idadebug::MemData;
 using idadebug::MemoryAS;
 using idadebug::MemoryAD;
@@ -42,6 +43,7 @@ using idadebug::DbgBreakpoints;
 using idadebug::Callstack;
 using idadebug::PauseChanged;
 using google::protobuf::Empty;
+using google::protobuf::BoolValue;
 using google::protobuf::Map;
 
 #include "gens.h"
@@ -147,7 +149,10 @@ HWND RamCheatHWnd = NULL; // modeless dialog
 std::vector<HWND> LuaScriptHWnds; // modeless dialogs
 HWND VolControlHWnd = NULL;
 
+#define DEBUG_PORT 23946
+
 int no_debug = 0;
+char DebugPort[256];
 char Str_Tmp[1024];
 char Comment[256];
 char Gens_Path[1024];
@@ -1076,6 +1081,25 @@ void CC_End_Callback(char mess[256])
 }
 #endif
 
+static int gens_debug_count = 0;
+
+static BOOL CALLBACK gens_debug_enum(HWND hwnd, LPARAM) {
+    char tmp[256];
+    GetClassNameA(hwnd, tmp, 255);
+
+    if (strncmp(tmp, GENS_CLASS_NAME, 9) == 0) {
+        gens_debug_count++;
+    }
+
+    return TRUE;
+}
+
+static int find_gensdebug() {
+    gens_debug_count = 0;
+    EnumWindows(gens_debug_enum, NULL);
+    return gens_debug_count - 1;
+}
+
 BOOL Init(HINSTANCE hInst, int nCmdShow)
 {
     int i;
@@ -1125,7 +1149,7 @@ BOOL Init(HINSTANCE hInst, int nCmdShow)
     WndClass.hCursor = LoadCursor(NULL, IDC_ARROW);
     WndClass.hbrBackground = NULL;
     WndClass.lpszMenuName = NULL;
-    WndClass.lpszClassName = "Gens";
+    WndClass.lpszClassName = GENS_CLASS_NAME;
 
     FrameCount = 0;
     LagCount = 0;
@@ -1138,7 +1162,7 @@ BOOL Init(HINSTANCE hInst, int nCmdShow)
 
     HWnd = CreateWindowEx(
         NULL,
-        "Gens",
+        GENS_CLASS_NAME,
         GENS_NAME " - Idle",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
@@ -1212,6 +1236,9 @@ BOOL Init(HINSTANCE hInst, int nCmdShow)
     Put_Info("   Gens Initialized", 1); // Modif N. -- added mainly to clear out some message gunk
 
     Gens_Running = 1;
+
+    int openedDebugs = find_gensdebug();
+    snprintf(DebugPort, 256, "%d", DEBUG_PORT + openedDebugs);
 
     return TRUE;
 }
@@ -1453,6 +1480,19 @@ public:
     return status.ok();
   }
 
+  bool eval_condition(uint32 elang, const char* condition) {
+      Condition req;
+      BoolValue resp;
+
+      req.set_elang(elang);
+      req.set_condition(condition);
+
+      ClientContext context;
+      Status status = stub_->eval_condition(&context, req, &resp);
+
+      return status.ok() && resp.value();
+  }
+
 private:
   std::unique_ptr<DbgClient::Stub> stub_;
 };
@@ -1465,6 +1505,14 @@ void send_pause_event(int pc, std::map<uint32_t, uint32_t> changed) {
   }
   
   client->pause_event(pc, changed);
+}
+
+bool evaluate_condition(uint32 elang, const char* condition) {
+    if (!client) {
+        return true;
+    }
+
+    return (condition && condition[0] == 0) || client->eval_condition(elang, condition);
 }
 
 void stop_client() {
@@ -1481,8 +1529,11 @@ void stop_client() {
 #endif
 }
 
-static void init_ida_client() {
-  auto channel = grpc::CreateChannel("localhost:9091", grpc::InsecureChannelCredentials());
+static void init_ida_client(int portnum) {
+  char tmp[256];
+  snprintf(tmp, 256, "localhost:%d", portnum);
+
+  auto channel = grpc::CreateChannel(tmp, grpc::InsecureChannelCredentials());
 
   while (channel->GetState(true) != GRPC_CHANNEL_READY) {
     Sleep(10);
@@ -1524,10 +1575,10 @@ static void toggle_pause() {
 class DbgServerHandler final : public DbgServer::Service {
   Status add_breakpoint(ServerContext* context, const DbgBreakpoint* request, Empty* response) override {
 #ifdef DEBUG_68K
-    Breakpoint b((bp_type)request->type(), request->bstart() & 0xFFFFFF, request->bend() & 0xFFFFFF, true, request->is_vdp(), false);
+    Breakpoint b((bp_type)request->type(), request->bstart() & 0xFFFFFF, request->bend() & 0xFFFFFF, true, request->is_vdp(), request->elang(), request->condition());
     M68kDW.Breakpoints.push_back(b);
 #else
-    Breakpoint b((bp_type)request->type(), request->bstart() & 0xFFFFFF, request->bend() & 0xFFFFFF, true, false);
+    Breakpoint b((bp_type)request->type(), request->bstart() & 0xFFFFFF, request->bend() & 0xFFFFFF, true, request->elang(), request->condition());
     Z80DW.Breakpoints.push_back(b);
 #endif
 
@@ -1609,7 +1660,8 @@ class DbgServerHandler final : public DbgServer::Service {
 #ifdef DEBUG_68K
       bpt->set_is_vdp(i->is_vdp);
 #endif
-      bpt->set_is_forbid(i->is_forbid);
+      bpt->set_elang(i->elang);
+      bpt->set_condition(i->condition.c_str());
       bpt->set_bstart(i->start);
       bpt->set_bend(i->end);
       bpt->set_type((BpType)i->type);
@@ -2086,7 +2138,7 @@ class DbgServerHandler final : public DbgServer::Service {
 #endif
 
   Status start_emulation(ServerContext* context, const Empty* request, Empty* response) override {
-    init_ida_client();
+    init_ida_client(atoi(DebugPort) + 1000);
 
     if (!client) {
       return Status::CANCELLED;
@@ -2162,7 +2214,8 @@ class DbgServerHandler final : public DbgServer::Service {
         if (request->is_vdp() == i->is_vdp) {
 #endif
           i->enabled = request->enabled();
-          i->is_forbid = request->is_forbid();
+          i->elang = request->elang();
+          i->condition = request->condition();
           break;
 #ifdef DEBUG_68K
       }
@@ -2209,8 +2262,11 @@ static void stop_server() {
   server->Shutdown(std::chrono::system_clock::now() + std::chrono::milliseconds(100));
 }
 
-static void DbgServerFunc() {
-  std::string server_address("0.0.0.0:9090");
+static void DbgServerFunc(int portnum) {
+  char tmp[256];
+  snprintf(tmp, 256, "127.0.0.1:%d", portnum);
+
+  std::string server_address(tmp);
   DbgServerHandler service;
 
   ServerBuilder builder;
@@ -2222,19 +2278,19 @@ static void DbgServerFunc() {
   server->Wait();
 }
 
-static void init_dbg_server() {
-  std::thread t1(DbgServerFunc);
+static void init_dbg_server(int portnum) {
+  std::thread t1(DbgServerFunc, portnum);
   t1.detach();
 
   atexit(stop_server);
 
 #ifdef DEBUG_68K
   M68kDW.Breakpoints.clear();
-  Breakpoint b(bp_type::BP_PC, main68k_context.pc & 0xFFFFFF, main68k_context.pc & 0xFFFFFF, true, false, false);
+  Breakpoint b(bp_type::BP_PC, main68k_context.pc & 0xFFFFFF, main68k_context.pc & 0xFFFFFF, true, false, 0, "");
   M68kDW.Breakpoints.push_back(b);
 #else
   Z80DW.Breakpoints.clear();
-  Breakpoint b(bp_type::BP_PC, 0, 0, true, false);
+  Breakpoint b(bp_type::BP_PC, 0, 0, true, 0, "");
   Z80DW.Breakpoints.push_back(b);
 #endif
 
@@ -2656,7 +2712,7 @@ int GensLoadRom(const char* filename)
     ReopenRamWindows();
 
     if (!no_debug) {
-      init_dbg_server();
+      init_dbg_server(atoi(DebugPort));
     }
 
     return loaded; // positive = success
@@ -6291,7 +6347,7 @@ LRESULT CALLBACK AboutProc(HWND hDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
         SetWindowPos(hDlg, NULL, std::max(0L, r.left + (dx1 - dx2)), std::max(0L, r.top + (dy1 - dy2)), NULL, NULL, SWP_NOSIZE | SWP_NOZORDER | SWP_SHOWWINDOW);
 
         SetDlgItemText(hDlg, IDC_EDIT1,
-            "Original version (c) 1999/2002 by Stéphane Dallongeville" "\r\n" "\r\n"
+            "Original version (c) 1999/2002 by Stï¿½phane Dallongeville" "\r\n" "\r\n"
             "More about this mod at:" "\r\n"
             "https://github.com/lab313ru/smd_ida_tools2"
         );

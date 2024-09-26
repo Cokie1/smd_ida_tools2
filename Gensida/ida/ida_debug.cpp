@@ -1,8 +1,5 @@
-#include <Windows.h>
-#include <algorithm>
-#include <vector>
-#include <iostream>
 #include <thread>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 
@@ -33,6 +30,7 @@ using idadebug::VdpRegs;
 using idadebug::DmaInfo;
 #endif
 using idadebug::Changed;
+using idadebug::Condition;
 using idadebug::MemData;
 using idadebug::MemoryAS;
 using idadebug::MemoryAD;
@@ -42,19 +40,18 @@ using idadebug::DbgBreakpoints;
 using idadebug::Callstack;
 using idadebug::PauseChanged;
 using google::protobuf::Empty;
+using google::protobuf::BoolValue;
 using google::protobuf::Map;
 
 #include <ida.hpp>
 #include <idd.hpp>
 #include <dbg.hpp>
-#include <diskio.hpp>
 #include <auto.hpp>
-#include <funcs.hpp>
+#include <expr.hpp>
 
 #include "ida_debmod.h"
 
 #include "ida_registers.h"
-#include "ida_debug.h"
 #include "ida_plugin.h"
 
 
@@ -252,6 +249,58 @@ void stop_server() {
   server->Shutdown(); //std::chrono::system_clock::now() + std::chrono::milliseconds(100));
 }
 
+static class cond_break_t : public exec_request_t {
+    uint32 elang = 0;
+    const char* cond = nullptr;
+public:
+    cond_break_t() {};
+    cond_break_t(uint32 _elang, const char* _cond) : elang(_elang), cond(_cond) {};
+
+    int idaapi execute(void) override {
+        extlang_object_t elng = find_extlang_by_index(elang);
+
+        idc_value_t rv;
+        qstring errbuf;
+        qstring func;
+
+        if (elng->is_idc()) {
+            func.sprnt("static main() {\n");
+        }
+        else {
+            func.sprnt("def main():\n");
+        }
+
+        qstrvec_t lines;
+        qstring full(cond);
+        full.split(&lines, "\n");
+
+        for (const auto line : lines) {
+            func.cat_sprnt("  %s\n", line.c_str());
+        }
+
+        if (elng->is_idc()) {
+            func.cat_sprnt("}\n");
+        }
+
+        bool res = elng->eval_snippet(func.c_str(), &errbuf);
+
+        if (!res || !errbuf.empty()) {
+            warning(errbuf.c_str());
+        }
+        else {
+            res = elng->call_func(&rv, "main", nullptr, 0, &errbuf);
+
+            if (!res || !errbuf.empty()) {
+                warning(errbuf.c_str());
+            }
+            else {
+                return rv.num;
+            }
+        }
+        return 1;
+    }
+};
+
 class DbgClientHandler final : public DbgClient::Service {
   Status pause_event(ServerContext* context, const PauseChanged* request, Empty* response) override {
     apply_codemap(request->changed());
@@ -294,14 +343,25 @@ class DbgClientHandler final : public DbgClient::Service {
 
     return Status::OK;
   }
+
+  Status eval_condition(ServerContext* context, const Condition* request, BoolValue* response) override {
+      suspend_process();
+      cond_break_t cond(request->elang(), request->condition().c_str());
+      int res = execute_sync(cond, MFF_FAST);
+      response->set_value(res);
+      continue_process();
+      return Status::OK;
+  }
 };
 
-static void IdaServerFunc() {
-  std::string server_address("0.0.0.0:9091");
+static void IdaServerFunc(int portnum) {
+  qstring server_address("127.0.0.1:");
+  server_address.cat_sprnt("%d", portnum);
+
   DbgClientHandler service;
 
   ServerBuilder builder;
-  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+  builder.AddListeningPort(server_address.c_str(), grpc::InsecureServerCredentials());
   builder.RegisterService(&service);
 
   server = builder.BuildAndStart();
@@ -309,8 +369,8 @@ static void IdaServerFunc() {
   server->Wait();
 }
 
-static void init_ida_server() {
-  std::thread t1(IdaServerFunc);
+static void init_ida_server(int portnum) {
+  std::thread t1(IdaServerFunc, portnum);
   t1.detach();
 }
 
@@ -713,8 +773,11 @@ static bool finish_execution() {
   return true;
 }
 
-static bool init_emu_client() {
-  auto channel = grpc::CreateChannel("localhost:9090", grpc::InsecureChannelCredentials());
+static bool init_emu_client(int portnum) {
+  qstring conn;
+  conn.sprnt("localhost:%d", portnum);
+
+  auto channel = grpc::CreateChannel(conn.c_str(), grpc::InsecureChannelCredentials());
 
   show_wait_box("Waiting for GENS emulation...");
 
@@ -738,6 +801,9 @@ static bool init_emu_client() {
 static drc_t idaapi init_debugger(const char* hostname, int portnum, const char* password, qstring *errbuf) {
 #ifdef DEBUG_68K
   set_processor_type("68020", SETPROC_LOADER); // reset proc to "M68020"
+  netnode n;
+  n.create("$ portnum");
+  n.set_long(portnum == 0 ? 23946 : portnum);
 #endif
   return DRC_OK;
 }
@@ -778,8 +844,10 @@ static drc_t idaapi s_start_process(const char* path,
   qstring* errbuf = NULL) {
   events.clear();
 
-  init_ida_server();
-  if (!init_emu_client() || (client && !client->start())) {
+  netnode n("$ portnum");
+  int port = n.long_value();
+  init_ida_server(port+1000);
+  if (!init_emu_client(port) || (client && !client->start())) {
     return DRC_NETERR;
   }
 
@@ -1140,6 +1208,10 @@ static int idaapi is_ok_bpt(bpttype_t type, ea_t ea, int len) {
 // This function is called from debthread
 static drc_t idaapi update_bpts(int* nbpts, update_bpt_info_t *bpts, int nadd, int ndel, qstring *errbuf) {
   for (int i = 0; i < nadd; ++i) {
+    if (bpts[i].code == BPT_SKIP) {
+      continue;
+    }
+    
     ea_t start = bpts[i].ea;
     ea_t end = bpts[i].ea + bpts[i].size - 1;
 
@@ -1182,7 +1254,12 @@ static drc_t idaapi update_bpts(int* nbpts, update_bpt_info_t *bpts, int nadd, i
 #ifdef DEBUG_68K
     bp.set_is_vdp(is_vdp);
 #endif
-    bp.set_is_forbid(false);
+
+    bpt_t bpt;
+    if (get_bpt(start, &bpt) && !bpt.cndbody.empty()) {
+        bp.set_elang(bpt.get_cnd_elang_idx());
+        bp.set_condition(bpt.cndbody.c_str());
+    }
 
     if (client && !client->add_breakpoint(bp)) {
       return DRC_FAILED;
@@ -1200,6 +1277,10 @@ static drc_t idaapi update_bpts(int* nbpts, update_bpt_info_t *bpts, int nadd, i
   }
 
   for (int i = 0; i < ndel; ++i) {
+    if (bpts[nadd + i].code == BPT_SKIP) {
+      continue;
+    }
+    
     ea_t start = bpts[nadd + i].ea;
     ea_t end = bpts[nadd + i].ea + bpts[nadd + i].size - 1;
     BpType type1 = BpType::BP_PC;
@@ -1241,7 +1322,12 @@ static drc_t idaapi update_bpts(int* nbpts, update_bpt_info_t *bpts, int nadd, i
 #ifdef DEBUG_68K
     bp.set_is_vdp(is_vdp);
 #endif
-    bp.set_is_forbid(false);
+
+    bpt_t bpt;
+    if (get_bpt(start, &bpt) && !bpt.cndbody.empty()) {
+        bp.set_elang(bpt.get_cnd_elang_idx());
+        bp.set_condition(bpt.cndbody.c_str());
+    }
 
     if (client && !client->del_breakpoint(bp)) {
       return DRC_FAILED;
@@ -1265,67 +1351,67 @@ static drc_t idaapi update_bpts(int* nbpts, update_bpt_info_t *bpts, int nadd, i
 // Update low-level (server side) breakpoint conditions
 // Returns nlowcnds. -1-network error
 // This function is called from debthread
-static drc_t idaapi update_lowcnds(int* nupdated, const lowcnd_t *lowcnds, int nlowcnds, qstring* errbuf) {
-  for (int i = 0; i < nlowcnds; ++i) {
-    ea_t start = lowcnds[i].ea;
-    ea_t end = lowcnds[i].ea + lowcnds[i].size - 1;
-    BpType type1 = BpType::BP_PC;
-    int type2 = 0;
-#ifdef DEBUG_68K
-    bool is_vdp = false;
-#endif
-
-    switch (lowcnds[i].type) {
-    case BPT_EXEC:
-      type1 = BpType::BP_PC;
-      break;
-    case BPT_READ:
-      type1 = BpType::BP_READ;
-      break;
-    case BPT_WRITE:
-      type1 = BpType::BP_WRITE;
-      break;
-    case BPT_RDWR:
-      type1 = BpType::BP_READ;
-      type2 = (int)BpType::BP_WRITE;
-      break;
-    }
-
-#ifdef DEBUG_68K
-    if (start >= BREAKPOINTS_BASE && end < BREAKPOINTS_BASE + 0x30000) {
-      start -= BREAKPOINTS_BASE;
-      end -= BREAKPOINTS_BASE;
-      is_vdp = true;
-    }
-#endif
-
-    DbgBreakpoint bp;
-    bp.set_bstart(start & 0xFFFFFF);
-    bp.set_bend(end & 0xFFFFFF);
-    bp.set_type(type1);
-
-    bp.set_enabled(true);
-#ifdef DEBUG_68K
-    bp.set_is_vdp(is_vdp);
-#endif
-    bp.set_is_forbid(lowcnds[i].cndbody.empty() ? false : ((lowcnds[i].cndbody[0] == '1') ? true : false));
-
-    if (client && !client->update_breakpoint(bp)) {
-      return DRC_FAILED;
-    }
-
-    if (type2 != 0) {
-      bp.set_type((BpType)type2);
-
-      if (client && !client->update_breakpoint(bp)) {
-        return DRC_FAILED;
-      }
-    }
-  }
-
-  *nupdated = nlowcnds;
-  return DRC_OK;
-}
+//static drc_t idaapi update_lowcnds(int* nupdated, const lowcnd_t *lowcnds, int nlowcnds, qstring* errbuf) {
+//  for (int i = 0; i < nlowcnds; ++i) {
+//    ea_t start = lowcnds[i].ea;
+//    ea_t end = lowcnds[i].ea + lowcnds[i].size - 1;
+//    BpType type1 = BpType::BP_PC;
+//    int type2 = 0;
+//#ifdef DEBUG_68K
+//    bool is_vdp = false;
+//#endif
+//
+//    switch (lowcnds[i].type) {
+//    case BPT_EXEC:
+//      type1 = BpType::BP_PC;
+//      break;
+//    case BPT_READ:
+//      type1 = BpType::BP_READ;
+//      break;
+//    case BPT_WRITE:
+//      type1 = BpType::BP_WRITE;
+//      break;
+//    case BPT_RDWR:
+//      type1 = BpType::BP_READ;
+//      type2 = (int)BpType::BP_WRITE;
+//      break;
+//    }
+//
+//#ifdef DEBUG_68K
+//    if (start >= BREAKPOINTS_BASE && end < BREAKPOINTS_BASE + 0x30000) {
+//      start -= BREAKPOINTS_BASE;
+//      end -= BREAKPOINTS_BASE;
+//      is_vdp = true;
+//    }
+//#endif
+//
+//    DbgBreakpoint bp;
+//    bp.set_bstart(start & 0xFFFFFF);
+//    bp.set_bend(end & 0xFFFFFF);
+//    bp.set_type(type1);
+//
+//    bp.set_enabled(true);
+//#ifdef DEBUG_68K
+//    bp.set_is_vdp(is_vdp);
+//#endif
+//    bp.set_is_forbid(lowcnds[i].cndbody.empty() ? false : ((lowcnds[i].cndbody[0] == '1') ? true : false));
+//
+//    if (client && !client->update_breakpoint(bp)) {
+//      return DRC_FAILED;
+//    }
+//
+//    if (type2 != 0) {
+//      bp.set_type((BpType)type2);
+//
+//      if (client && !client->update_breakpoint(bp)) {
+//        return DRC_FAILED;
+//      }
+//    }
+//  }
+//
+//  *nupdated = nlowcnds;
+//  return DRC_OK;
+//}
 
 // Calculate the call stack trace
 // This function is called when the process is suspended and should fill
@@ -1563,23 +1649,21 @@ static ssize_t idaapi idd_notify(void*, int msgid, va_list va) {
   }
   break;
 
-  case debugger_t::ev_update_lowcnds: {
+  /*case debugger_t::ev_update_lowcnds: {
       int* nupdated = va_arg(va, int*);
       const lowcnd_t* lowcnds = va_arg(va, const lowcnd_t*);
       int nlowcnds = va_arg(va, int);
       errbuf = va_arg(va, qstring*);
       retcode = update_lowcnds(nupdated, lowcnds, nlowcnds, errbuf);
   }
-  break;
+  break;*/
 
-#ifdef HAVE_UPDATE_CALL_STACK
   case debugger_t::ev_update_call_stack: {
     thid_t tid = va_argi(va, thid_t);
     call_stack_t* trace = va_arg(va, call_stack_t*);
     retcode = update_call_stack(tid, trace);
   }
   break;
-#endif
 
   //case debugger_t::ev_eval_lowcnd: {
   //  thid_t tid = va_argi(va, thid_t);
@@ -1624,8 +1708,8 @@ debugger_t debugger = {
   0x8000 + 2,
   "z80",
 #endif
-  DBG_FLAG_NOHOST | DBG_FLAG_CAN_CONT_BPT | DBG_FLAG_FAKE_ATTACH | DBG_FLAG_SAFE | DBG_FLAG_NOPASSWORD | DBG_FLAG_NOSTARTDIR | DBG_FLAG_NOPARAMETERS | DBG_FLAG_ANYSIZE_HWBPT | DBG_FLAG_DEBTHREAD | DBG_FLAG_PREFER_SWBPTS,
-  DBG_HAS_GET_PROCESSES | DBG_HAS_REQUEST_PAUSE | DBG_HAS_SET_RESUME_MODE | DBG_HAS_CHECK_BPT | DBG_HAS_THREAD_SUSPEND | DBG_HAS_THREAD_CONTINUE | DBG_FLAG_LOWCNDS | DBG_FLAG_CONNSTRING,
+  DBG_FLAG_NOHOST | DBG_FLAG_CAN_CONT_BPT | DBG_FLAG_SAFE | DBG_FLAG_FAKE_ATTACH | DBG_FLAG_NOPASSWORD | DBG_FLAG_NOSTARTDIR | DBG_FLAG_NOPARAMETERS | DBG_FLAG_ANYSIZE_HWBPT | DBG_FLAG_DEBTHREAD | DBG_FLAG_PREFER_SWBPTS /*| DBG_FLAG_LOWCNDS*/,
+  DBG_HAS_GET_PROCESSES | DBG_HAS_REQUEST_PAUSE | DBG_HAS_SET_RESUME_MODE | DBG_HAS_CHECK_BPT | DBG_HAS_THREAD_SUSPEND | DBG_HAS_THREAD_CONTINUE,
 
   register_classes,
   RC_GENERAL,
